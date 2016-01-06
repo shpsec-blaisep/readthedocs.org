@@ -105,6 +105,7 @@ class CommunityBaseSettings(Settings):
             'allauth.socialaccount',
             'allauth.socialaccount.providers.github',
             'allauth.socialaccount.providers.bitbucket',
+            'allauth.socialaccount.providers.bitbucket_oauth2',
         ]
         if self.DEBUG:
             apps.append('django_extensions')
@@ -149,9 +150,6 @@ class CommunityBaseSettings(Settings):
         "django.core.context_processors.request",
         # Read the Docs processor
         "readthedocs.core.context_processors.readthedocs_processor",
-        # allauth specific context processors
-        "allauth.account.context_processors.account",
-        "allauth.socialaccount.context_processors.socialaccount",
     )
 
     # Paths
