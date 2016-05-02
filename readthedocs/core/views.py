@@ -3,31 +3,28 @@ documentation and header rendering, and server errors.
 
 """
 
-from django.contrib.auth.models import User
+from django.contrib import admin, messages
 from django.core.urlresolvers import reverse
 from django.conf import settings
 from django.http import HttpResponse, HttpResponseRedirect, Http404, HttpResponseNotFound
 from django.shortcuts import render_to_response, get_object_or_404, redirect
-from django.db.models import Max, F
 from django.template import RequestContext
 from django.views.decorators.csrf import csrf_exempt
 from django.views.static import serve
-from django.views.generic import TemplateView
+from django.views.generic import TemplateView, FormView
 
 from haystack.query import EmptySearchQuerySet
 from haystack.query import SearchQuerySet
-import stripe
 
 from readthedocs.builds.models import Build
 from readthedocs.builds.models import Version
-from readthedocs.core.forms import FacetedSearchForm
-from readthedocs.core.utils import trigger_build
+from readthedocs.core.forms import FacetedSearchForm, SendEmailForm
+from readthedocs.core.utils import trigger_build, broadcast, send_email
 from readthedocs.donate.mixins import DonateProgressMixin
 from readthedocs.builds.constants import LATEST
 from readthedocs.projects import constants
 from readthedocs.projects.models import Project, ImportedFile, ProjectRelationship
 from readthedocs.projects.tasks import remove_dir, update_imported_docs
-from readthedocs.redirects.models import Redirect
 from readthedocs.redirects.utils import get_redirect_response
 
 import json
@@ -65,6 +62,20 @@ class HomepageView(DonateProgressMixin, TemplateView):
                 latest.append(build.project)
         context['project_list'] = latest
         context['featured_list'] = Project.objects.filter(featured=True)
+        return context
+
+
+class SupportView(TemplateView):
+    template_name = 'support.html'
+
+    def get_context_data(self, **kwargs):
+        context = super(SupportView, self).get_context_data(**kwargs)
+        support_email = getattr(settings, 'SUPPORT_EMAIL', None)
+        if not support_email:
+            support_email = 'support@{domain}'.format(
+                domain=getattr(settings, 'PRODUCTION_DOMAIN', 'readthedocs.org'))
+
+        context['support_email'] = support_email
         return context
 
 
@@ -107,14 +118,7 @@ def wipe_version(request, project_slug, version_slug):
             os.path.join(version.project.doc_path, 'conda', version.slug),
         ]
         for del_dir in del_dirs:
-            # Support hacky "broadcast" with MULTIPLE_BUILD_SERVERS setting,
-            # otherwise put in normal celery queue
-            for server in getattr(settings, "MULTIPLE_BUILD_SERVERS", ['celery']):
-                log.info('Removing files on %s' % server)
-                remove_dir.apply_async(
-                    args=[del_dir],
-                    queue=server,
-                )
+            broadcast(type='build', task=remove_dir, args=[del_dir])
         return redirect('project_version_list', project_slug)
     else:
         return render_to_response('wipe_version.html',
@@ -122,7 +126,15 @@ def wipe_version(request, project_slug, version_slug):
 
 
 def _build_version(project, slug, already_built=()):
+    """
+    Where we actually trigger builds for a project and slug.
+
+    All webhook logic should route here to call ``trigger_build``.
+    """
     default = project.default_branch or (project.vcs_repo().fallback_branch)
+    if not project.has_valid_webhook:
+        project.has_valid_webhook = True
+        project.save()
     if slug == default and slug not in already_built:
         # short circuit versions that are default
         # these will build at "latest", and thus won't be
@@ -153,6 +165,13 @@ def _build_version(project, slug, already_built=()):
 
 
 def _build_branches(project, branch_list):
+    """
+    Build the branches for a specific project.
+
+    Returns:
+        to_build - a list of branches that were built
+        not_building - a list of branches that we won't build
+    """
     for branch in branch_list:
         versions = project.versions_from_branch_name(branch)
         to_build = set()
@@ -168,35 +187,57 @@ def _build_branches(project, branch_list):
     return (to_build, not_building)
 
 
-def _build_url(url, branches):
-    try:
-        projects = (
-            Project.objects.filter(repo__endswith=url) |
-            Project.objects.filter(repo__endswith=url + '.git'))
-        if not projects.count():
-            raise NoProjectException()
-        for project in projects:
-            (to_build, not_building) = _build_branches(project, branches)
-            if not to_build:
-                update_imported_docs.delay(project.versions.get(slug=LATEST).pk)
-                msg = '(URL Build) Syncing versions for %s' % project.slug
-                pc_log.info(msg)
-        if to_build:
-            msg = '(URL Build) Build Started: %s [%s]' % (
-                url, ' '.join(to_build))
+def get_project_from_url(url):
+    projects = (
+        Project.objects.filter(repo__iendswith=url) |
+        Project.objects.filter(repo__iendswith=url + '.git'))
+    return projects
+
+
+def pc_log_info(project, msg):
+    pc_log.info(constants.LOG_TEMPLATE
+                .format(project=project,
+                        version='',
+                        msg=msg))
+
+
+def _build_url(url, projects, branches):
+    """
+    Map a URL onto specific projects to build that are linked to that URL.
+
+    Check each of the ``branches`` to see if they are active and should be built.
+    """
+    ret = ""
+    all_built = {}
+    all_not_building = {}
+    for project in projects:
+        (built, not_building) = _build_branches(project, branches)
+        if not built:
+            # Call update_imported_docs to update tag/branch info
+            update_imported_docs.delay(project.versions.get(slug=LATEST).pk)
+            msg = '(URL Build) Syncing versions for %s' % project.slug
             pc_log.info(msg)
-            return HttpResponse(msg)
-        else:
+        all_built[project.slug] = built
+        all_not_building[project.slug] = not_building
+
+    for project_slug, built in all_built.items():
+        if built:
+            msg = '(URL Build) Build Started: %s [%s]' % (
+                url, ' '.join(built))
+            pc_log_info(project_slug, msg=msg)
+            ret += msg
+
+    for project_slug, not_building in all_not_building.items():
+        if not_building:
             msg = '(URL Build) Not Building: %s [%s]' % (
                 url, ' '.join(not_building))
-            pc_log.info(msg)
-            return HttpResponse(msg)
-    except Exception as e:
-        if e.__class__ == NoProjectException:
-            raise
-        msg = "(URL Build) Failed: %s:%s" % (url, e)
-        pc_log.error(msg, exc_info=True)
-        return HttpResponse(msg)
+            pc_log_info(project_slug, msg=msg)
+            ret += msg
+
+    if not ret:
+        ret = '(URL Build) No known branches were pushed to.'
+
+    return HttpResponse(ret)
 
 
 @csrf_exempt
@@ -211,16 +252,30 @@ def github_build(request):
         except:
             # Generic post-commit hook
             obj = json.loads(request.body)
-        url = obj['repository']['url']
-        ghetto_url = url.replace('http://', '').replace('https://', '')
-        branch = obj['ref'].replace('refs/heads/', '')
-        pc_log.info("(Incoming GitHub Build) %s [%s]" % (ghetto_url, branch))
+        repo_url = obj['repository']['url']
+        hacked_repo_url = repo_url.replace('http://', '').replace('https://', '')
+        ssh_url = obj['repository']['ssh_url']
+        hacked_ssh_url = ssh_url.replace('git@', '').replace('.git', '')
         try:
-            return _build_url(ghetto_url, [branch])
+            branch = obj['ref'].replace('refs/heads/', '')
+        except KeyError:
+            response = HttpResponse('ref argument required to build branches.')
+            response.status_code = 400
+            return response
+
+        try:
+            repo_projects = get_project_from_url(hacked_repo_url)
+            if repo_projects:
+                pc_log.info("(Incoming GitHub Build) %s [%s]" % (hacked_repo_url, branch))
+            ssh_projects = get_project_from_url(hacked_ssh_url)
+            if ssh_projects:
+                pc_log.info("(Incoming GitHub Build) %s [%s]" % (hacked_ssh_url, branch))
+            projects = repo_projects | ssh_projects
+            return _build_url(hacked_repo_url, projects, [branch])
         except NoProjectException:
             pc_log.error(
-                "(Incoming GitHub Build) Repo not found:  %s" % ghetto_url)
-            return HttpResponseNotFound('Repo not found: %s' % ghetto_url)
+                "(Incoming GitHub Build) Repo not found:  %s" % hacked_repo_url)
+            return HttpResponseNotFound('Repo not found: %s' % hacked_repo_url)
     else:
         return HttpResponse("You must POST to this resource.")
 
@@ -241,9 +296,10 @@ def gitlab_build(request):
         ghetto_url = url.replace('http://', '').replace('https://', '')
         branch = obj['ref'].replace('refs/heads/', '')
         pc_log.info("(Incoming GitLab Build) %s [%s]" % (ghetto_url, branch))
-        try:
-            return _build_url(ghetto_url, [branch])
-        except NoProjectException:
+        projects = get_project_from_url(ghetto_url)
+        if projects:
+            return _build_url(ghetto_url, projects, [branch])
+        else:
             pc_log.error(
                 "(Incoming GitLab Build) Repo not found:  %s" % ghetto_url)
             return HttpResponseNotFound('Repo not found: %s' % ghetto_url)
@@ -262,13 +318,14 @@ def bitbucket_build(request):
         rep = obj['repository']
         branches = [rec.get('branch', '') for rec in obj['commits']]
         ghetto_url = "%s%s" % (
-            "bitbucket.org",  rep['absolute_url'].rstrip('/'))
+            "bitbucket.org", rep['absolute_url'].rstrip('/'))
         pc_log.info("(Incoming Bitbucket Build) %s [%s]" % (
             ghetto_url, ' '.join(branches)))
         pc_log.info("(Incoming Bitbucket Build) JSON: \n\n%s\n\n" % obj)
-        try:
-            return _build_url(ghetto_url, branches)
-        except NoProjectException:
+        projects = get_project_from_url(ghetto_url)
+        if projects:
+            return _build_url(ghetto_url, projects, branches)
+        else:
             pc_log.error(
                 "(Incoming Bitbucket Build) Repo not found:  %s" % ghetto_url)
             return HttpResponseNotFound('Repo not found: %s' % ghetto_url)
@@ -291,15 +348,10 @@ def generic_build(request, project_id_or_slug=None):
             return HttpResponseNotFound(
                 'Repo not found: %s' % project_id_or_slug)
     if request.method == 'POST':
-        slug = request.POST.get('version_slug', None)
-        if slug:
-            pc_log.info(
-                "(Incoming Generic Build) %s [%s]" % (project.slug, slug))
-            _build_version(project, slug)
-        else:
-            pc_log.info(
-                "(Incoming Generic Build) %s [%s]" % (project.slug, LATEST))
-            trigger_build(project=project, force=True)
+        slug = request.POST.get('version_slug', project.default_version)
+        pc_log.info(
+            "(Incoming Generic Build) %s [%s]" % (project.slug, slug))
+        _build_version(project, slug)
     else:
         return HttpResponse("You must POST to this resource.")
     return redirect('builds_project_list', project.slug)
@@ -760,3 +812,75 @@ class SearchView(TemplateView):
         Fetches the results via the form.
         """
         return self.form.search()
+
+
+class SendEmailView(FormView):
+
+    """Form view for sending emails to users from admin pages
+
+    Accepts the following additional parameters:
+
+    queryset
+        The queryset to use to determine the users to send emails to
+    """
+
+    form_class = SendEmailForm
+    template_name = 'core/send_email_form.html'
+
+    def get_form_kwargs(self):
+        """Override form kwargs based on input fields
+
+        The admin posts to this view initially, so detect the send button on
+        form post variables. Drop additional fields if we see the send button.
+        """
+        kwargs = super(SendEmailView, self).get_form_kwargs()
+        if 'send' not in self.request.POST:
+            kwargs.pop('data', None)
+            kwargs.pop('files', None)
+        return kwargs
+
+    def get_initial(self):
+        """Add selected ids to initial form data"""
+        initial = super(SendEmailView, self).get_initial()
+        initial['_selected_action'] = self.request.POST.getlist(
+            admin.ACTION_CHECKBOX_NAME)
+        return initial
+
+    def form_valid(self, form):
+        """If form is valid, send emails to selected users"""
+        count = 0
+        for user in self.get_queryset().all():
+            send_email(
+                user.email,
+                subject=form.cleaned_data['subject'],
+                template='core/email/common.txt',
+                template_html='core/email/common.html',
+                context={'user': user, 'content': form.cleaned_data['body']},
+                request=self.request,
+            )
+            count += 1
+        if count == 0:
+            self.message_user("No receipients to send to", level=messages.ERROR)
+        else:
+            self.message_user("Queued {0} messages".format(count))
+        return HttpResponseRedirect(self.request.get_full_path())
+
+    def get_queryset(self):
+        return self.kwargs.get('queryset')
+
+    def get_context_data(self, **kwargs):
+        """Return queryset in context"""
+        context = super(SendEmailView, self).get_context_data(**kwargs)
+        context['users'] = self.get_queryset().all()
+        return context
+
+    def message_user(self, message, level=messages.INFO, extra_tags='',
+                     fail_silently=False):
+        """Implementation of :py:meth:`django.contrib.admin.options.ModelAdmin.message_user`
+
+        Send message through messages framework
+        """
+        # TODO generalize this or check if implementation in ModelAdmin is
+        # useable here
+        messages.add_message(self.request, level, message, extra_tags=extra_tags,
+                             fail_silently=fail_silently)

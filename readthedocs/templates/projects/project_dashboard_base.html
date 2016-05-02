@@ -48,9 +48,11 @@
         <div class="module-wrapper">
 
           <div class="module-header">
+            {% block project_import_button %}
             <form method="get" action="{{ projects_import_url }}">
               <input type="submit" value="Import a Project" />
             </form>
+            {% endblock %}
             <h3>{% trans "Projects" %}</h3>
           </div>
 
@@ -148,8 +150,9 @@
     {% endblock %}
 
     <div class="module info info-docs">
+      <h3>Learn More</h3>
       <p>
-        Check out the <a href="http://docs.readthedocs.org/en/latest/index.html">documentation for Read the Docs</a>.
+        Check out the <a href="http://docs.readthedocs.io/en/latest/index.html">documentation for Read the Docs</a>.
         It contains lots of information about how to get the most out of RTD.
       </p>
     </div>

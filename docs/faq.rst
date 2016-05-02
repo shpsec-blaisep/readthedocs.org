@@ -23,16 +23,19 @@ as it `breaks the internet <http://www.w3.org/Provider/Style/URI.html>`_.
 How do I change behavior for Read the Docs?
 -------------------------------------------
 
-When RTD builds your project, it sets the `READTHEDOCS` environment variable to the string `True`. So within your Sphinx ``conf.py`` file, you can vary the behavior based on this. For example::
+When RTD builds your project, it sets the :envvar:`READTHEDOCS` environment
+variable to the string `True`. So within your Sphinx :file:`conf.py` file, you
+can vary the behavior based on this. For example::
 
     import os
-    on_rtd = os.environ.get('READTHEDOCS', None) == 'True'
+    on_rtd = os.environ.get('READTHEDOCS') == 'True'
     if on_rtd:
         html_theme = 'default'
     else:
         html_theme = 'nature'
 
-The ``READTHEDOCS`` variable is also available in the Sphinx build environment, and will be set to ``True`` when building on RTD::
+The :envvar:`READTHEDOCS` variable is also available in the Sphinx build
+environment, and will be set to ``True`` when building on RTD::
 
     {% if READTHEDOCS %}
     Woo
@@ -88,26 +91,6 @@ following settings::
     SLUMBER_USERNAME = 'test'
     SLUMBER_PASSWORD = 'test'
 
-Can I make search engines only see one version of my docs?
-----------------------------------------------------------
-
-You can do this for Google at least with a canonical link tag.
-It should look like:
-
-.. code-block:: jinja
-
-        <link rel="canonical" href="http://ericholscher.com/
-        {%- for word in pagename.split('/') -%}
-            {%- if word != 'index' -%}
-                {%- if word != '' -%}
-                    {{ word }}/
-                {%- endif -%}
-            {%- endif -%}
-        {%- endfor -%}
-        {% if builder == "dirhtml" %}/{% else %}.html{% endif %}
-        ">
-
-
 Deleting a stale or broken build environment
 --------------------------------------------
 
@@ -124,9 +107,9 @@ that documentation will also be served under the parent project's subdomain.
 
 For example,
 Kombu is a subproject of celery,
-so you can access it on the `celery.readthedocs.org` domain:
+so you can access it on the `celery.readthedocs.io` domain:
 
-http://celery.readthedocs.org/projects/kombu/en/latest/
+http://celery.readthedocs.io/projects/kombu/en/latest/
 
 This also works the same for CNAMEs:
 
@@ -187,7 +170,7 @@ Read The Docs theme handles both formats just fine, provided
 your ``conf.py`` specifies an appropriate Sphinx extension that
 knows how to convert your customized docstrings.  Two such extensions
 are `numpydoc <https://github.com/numpy/numpydoc>`_ and
-`napoleon <http://sphinxcontrib-napoleon.readthedocs.org>`_. Only
+`napoleon <http://sphinxcontrib-napoleon.readthedocs.io>`_. Only
 ``napoleon`` is able to handle both docstring formats. Its default
 output more closely matches the format of standard Sphinx annotations,
 and as a result, it tends to look a bit better with the default theme.

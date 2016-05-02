@@ -98,14 +98,15 @@ class BaseMkdocs(BaseBuilder):
         # Will be available in the JavaScript as READTHEDOCS_DATA.
         readthedocs_data = {
             'project': self.version.project.slug,
-            'version': self.version.verbose_name,
+            'version': self.version.slug,
             'language': self.version.project.language,
             'page': None,
             'theme': "readthedocs",
             'builder': "mkdocs",
             'docroot': docs_dir,
             'source_suffix': ".md",
-            'api_host': getattr(settings, 'SLUMBER_API_HOST', 'https://readthedocs.org'),
+            'api_host': getattr(settings, 'PUBLIC_API_URL',
+                                'https://readthedocs.org'),
             'commit': self.version.project.vcs_repo(self.version.slug).commit,
         }
         data_json = json.dumps(readthedocs_data, indent=4)
@@ -122,7 +123,10 @@ class BaseMkdocs(BaseBuilder):
 
         data_file = open(os.path.join(self.root_path, docs_dir, 'readthedocs-data.js'), 'w+')
         data_file.write(data_string)
-        data_file.write('\nREADTHEDOCS_DATA["page"] = mkdocs_page_name')
+        data_file.write('''
+READTHEDOCS_DATA["page"] = mkdocs_page_input_path.substr(
+    0, mkdocs_page_input_path.lastIndexOf(READTHEDOCS_DATA.source_suffix));
+''')
         data_file.close()
 
         include_ctx = {

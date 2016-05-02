@@ -5,12 +5,10 @@ import os
 from urlparse import urlparse
 
 from django.conf import settings
-from django.core.mail import EmailMultiAlternatives
-from django.template.loader import get_template
 
 from readthedocs.builds.constants import LATEST
-from readthedocs.builds.constants import LATEST_VERBOSE_NAME
-from readthedocs.builds.models import Build
+from ..tasks import send_email_task
+
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +30,20 @@ def run_on_app_servers(command):
     else:
         ret = os.system(command)
         return ret
+
+
+def broadcast(type, task, args):
+    assert type in ['web', 'app', 'build']
+    default_queue = getattr(settings, 'CELERY_DEFAULT_QUEUE', 'celery')
+    if type in ['web', 'app']:
+        servers = getattr(settings, "MULTIPLE_APP_SERVERS", [default_queue])
+    elif type in ['build']:
+        servers = getattr(settings, "MULTIPLE_BUILD_SERVERS", [default_queue])
+    for server in servers:
+        task.apply_async(
+            queue=server,
+            args=args,
+        )
 
 
 def clean_url(url):
@@ -61,6 +73,7 @@ def trigger_build(project, version=None, record=True, force=False, basic=False):
     """
     # Avoid circular import
     from readthedocs.projects.tasks import update_docs
+    from readthedocs.builds.models import Build
 
     if project.skip:
         return None
@@ -89,7 +102,7 @@ def trigger_build(project, version=None, record=True, force=False, basic=False):
 
     options = {}
     if project.build_queue:
-        options['queue'] = 'build-{0}'.format(project.build_queue)
+        options['queue'] = project.build_queue
 
     update_docs.apply_async(kwargs=kwargs, **options)
 
@@ -98,38 +111,15 @@ def trigger_build(project, version=None, record=True, force=False, basic=False):
 
 def send_email(recipient, subject, template, template_html, context=None,
                request=None):
-    '''
-    Send multipart email
+    """Alter context passed in and call email send task
 
-    recipient
-        Email recipient address
+    .. seealso::
 
-    subject
-        Email subject header
-
-    template
-        Plain text template to send
-
-    template_html
-        HTML template to send as new message part
-
-    context
-        A dictionary to pass into the template calls
-
-    request
-        Request object for determining absolute URL
-    '''
-    if request:
-        scheme = 'https' if request.is_secure() else 'http'
-        context['uri'] = '{scheme}://{host}'.format(scheme=scheme,
-                                                    host=request.get_host())
-    ctx = {}
-    ctx.update(context)
-    msg = EmailMultiAlternatives(
-        subject,
-        get_template(template).render(ctx),
-        settings.DEFAULT_FROM_EMAIL,
-        [recipient]
-    )
-    msg.attach_alternative(get_template(template_html).render(ctx), 'text/html')
-    msg.send()
+        Task :py:func:`readthedocs.core.tasks.send_email_task`
+            Task that handles templating and sending email message
+    """
+    if context is None:
+        context = {}
+    context['uri'] = '{scheme}://{host}'.format(
+        scheme='https', host=settings.PRODUCTION_DOMAIN)
+    send_email_task.delay(recipient, subject, template, template_html, context)

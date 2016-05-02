@@ -8,7 +8,7 @@ import os
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.exceptions import MultipleObjectsReturned
-from django.core.urlresolvers import reverse
+from django.core.urlresolvers import reverse, NoReverseMatch
 from django.db import models
 from django.template.defaultfilters import slugify
 from django.utils.translation import ugettext_lazy as _
@@ -17,17 +17,18 @@ from guardian.shortcuts import assign
 from taggit.managers import TaggableManager
 
 from readthedocs.api.client import api
+from readthedocs.core.utils import broadcast
 from readthedocs.restapi.client import api as apiv2
 from readthedocs.builds.constants import LATEST, LATEST_VERBOSE_NAME, STABLE
-from readthedocs.privacy.loader import RelatedProjectManager, ProjectManager
+from readthedocs.privacy.loader import (RelatedProjectManager, ProjectManager,
+                                        ChildRelatedProjectManager)
 from readthedocs.projects import constants
 from readthedocs.projects.exceptions import ProjectImportError
 from readthedocs.projects.templatetags.projects_tags import sort_version_aware
-from readthedocs.projects.utils import (make_api_version, symlink,
-                                        update_static_metadata)
+from readthedocs.projects.utils import make_api_version, update_static_metadata
 from readthedocs.projects.version_handling import determine_stable_version
 from readthedocs.projects.version_handling import version_windows
-from readthedocs.core.resolver import resolve
+from readthedocs.core.resolver import resolve, resolve_domain
 from readthedocs.core.validators import validate_domain_name
 
 from readthedocs.vcs_support.base import VCSProject
@@ -56,6 +57,8 @@ class ProjectRelationship(models.Model):
     child = models.ForeignKey('Project', verbose_name=_('Child'),
                               related_name='superprojects')
     alias = models.CharField(_('Alias'), max_length=255, null=True, blank=True)
+
+    objects = ChildRelatedProjectManager()
 
     def __unicode__(self):
         return "%s -> %s" % (self.parent, self.child)
@@ -155,6 +158,9 @@ class Project(models.Model):
         _('Container time limit'), max_length=10, null=True, blank=True)
     build_queue = models.CharField(
         _('Alternate build queue id'), max_length=32, null=True, blank=True)
+    allow_promos = models.BooleanField(
+        _('Sponsor advertisements'), default=True, help_text=_(
+            "Allow sponsor advertisements on my project documentation"))
 
     # Sphinx specific build options.
     enable_epub_build = models.BooleanField(
@@ -262,6 +268,13 @@ class Project(models.Model):
         help_text=_("2 means supporting 2.2.2 and 2.2.1, but not 2.2.0")
     )
 
+    has_valid_webhook = models.BooleanField(
+        default=False, help_text=_('This project has been built with a webhook')
+    )
+    has_valid_clone = models.BooleanField(
+        default=False, help_text=_('This project has been successfully cloned')
+    )
+
     tags = TaggableManager(blank=True)
     objects = ProjectManager()
     all_objects = models.Manager()
@@ -277,16 +290,6 @@ class Project(models.Model):
     def __unicode__(self):
         return self.name
 
-    @property
-    def subdomain(self):
-        try:
-            domain = self.domains.get(canonical=True)
-            return domain.domain
-        except (Domain.DoesNotExist, MultipleObjectsReturned):
-            subdomain_slug = self.slug.replace('_', '-')
-            prod_domain = getattr(settings, 'PRODUCTION_DOMAIN')
-            return "%s.%s" % (subdomain_slug, prod_domain)
-
     def sync_supported_versions(self):
         supported = self.supported_versions()
         if supported:
@@ -297,6 +300,7 @@ class Project(models.Model):
             self.versions.filter(verbose_name=LATEST_VERBOSE_NAME).update(supported=True)
 
     def save(self, *args, **kwargs):
+        from readthedocs.projects import tasks
         first_save = self.pk is None
         if not self.slug:
             # Subdomains can't have underscores in them.
@@ -322,7 +326,7 @@ class Project(models.Model):
             log.error('failed to sync supported versions', exc_info=True)
         try:
             if not first_save:
-                symlink(project=self)
+                broadcast(type='app', task=tasks.symlink_project, args=[self.pk])
         except Exception:
             log.error('failed to symlink project', exc_info=True)
         try:
@@ -333,8 +337,6 @@ class Project(models.Model):
             branch = self.default_branch or self.vcs_repo().fallback_branch
             if not self.versions.filter(slug=LATEST).exists():
                 self.versions.create_latest(identifier=branch)
-            # if not self.versions.filter(slug=STABLE).exists():
-            #     self.versions.create_stable(type=BRANCH, identifier=branch)
         except Exception:
             log.error('Error creating default branches', exc_info=True)
 
@@ -359,6 +361,21 @@ class Project(models.Model):
         else:
             return self.get_docs_url()
 
+    def get_subproject_urls(self):
+        """List subproject URLs
+
+        This is used in search result linking
+        """
+        if getattr(settings, 'DONT_HIT_DB', True):
+            return [(proj['slug'], proj['canonical_url'])
+                    for proj in (
+                        apiv2.project(self.pk)
+                        .subprojects()
+                        .get()['subprojects'])]
+        else:
+            return [(proj.child.slug, proj.child.get_docs_url())
+                    for proj in self.subprojects.all()]
+
     def get_production_media_path(self, type_, version_slug, include_file=True):
         """
         This is used to see if these files exist so we can offer them for download.
@@ -382,14 +399,21 @@ class Project(models.Model):
 
     def get_production_media_url(self, type_, version_slug, full_path=True):
         """Get the URL for downloading a specific media file."""
-        path = reverse('project_download_media', kwargs={
-            'project_slug': self.slug,
-            'type_': type_,
-            'version_slug': version_slug,
-        })
+        try:
+            path = reverse('project_download_media', kwargs={
+                'project_slug': self.slug,
+                'type_': type_,
+                'version_slug': version_slug,
+            })
+        except NoReverseMatch:
+            return ''
         if full_path:
             path = '//%s%s' % (settings.PRODUCTION_DOMAIN, path)
         return path
+
+    def subdomain(self):
+        """Get project subdomain from resolver"""
+        return resolve_domain(self)
 
     def get_downloads(self):
         downloads = {}
@@ -425,27 +449,11 @@ class Project(models.Model):
     #
     # Paths for symlinks in project doc_path.
     #
-    def cnames_symlink_path(self, domain):
-        """
-        Path in the doc_path that we symlink cnames
-
-        This has to be at the top-level because Nginx doesn't know the projects slug.
-        """
-        return os.path.join(settings.CNAME_ROOT, domain)
-
     def translations_symlink_path(self, language=None):
         """Path in the doc_path that we symlink translations"""
         if not language:
             language = self.language
         return os.path.join(self.doc_path, 'translations', language)
-
-    def subprojects_symlink_path(self, project):
-        """Path in the doc_path that we symlink subprojects"""
-        return os.path.join(self.doc_path, 'subprojects', project)
-
-    def single_version_symlink_path(self):
-        """Path in the doc_path for the single_version symlink"""
-        return os.path.join(self.doc_path, 'single_version')
 
     #
     # End symlink paths
@@ -718,13 +726,6 @@ class Project(models.Model):
                     identifier=new_stable.identifier)
                 return new_stable
 
-    def version_from_branch_name(self, branch):
-        versions = self.versions_from_branch_name(branch)
-        try:
-            return versions[0]
-        except IndexError:
-            return None
-
     def versions_from_branch_name(self, branch):
         return (
             self.versions.filter(identifier=branch) |
@@ -902,9 +903,16 @@ class Domain(models.Model):
         return "{domain} pointed at {project}".format(domain=self.domain, project=self.project.name)
 
     def save(self, *args, **kwargs):
+        from readthedocs.projects import tasks
         parsed = urlparse(self.domain)
         if parsed.scheme or parsed.netloc:
             self.domain = parsed.netloc
         else:
             self.domain = parsed.path
         super(Domain, self).save(*args, **kwargs)
+        broadcast(type='app', task=tasks.symlink_domain, args=[self.project.pk, self.pk])
+
+    def delete(self, *args, **kwargs):
+        from readthedocs.projects import tasks
+        broadcast(type='app', task=tasks.symlink_domain, args=[self.project.pk, self.pk, True])
+        super(Domain, self).delete(*args, **kwargs)
